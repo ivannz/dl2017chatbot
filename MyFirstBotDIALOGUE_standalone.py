@@ -18,6 +18,8 @@ from lasagne.utils import floatX
 
 from lasagne.layers.base import Layer
 
+from broadcast import BroadcastLayer, UnbroadcastLayer
+
 from telegram.ext import CommandHandler, Filters, Job
 from telegram.ext import MessageHandler, Updater
 
@@ -52,7 +54,7 @@ class DelayedKeyboardInterrupt(object):
 #                           UNSERIALIZE THE NETWORK                           #
 ###############################################################################
 # Load the vocbulary and weights
-model_file = None
+model_file = "pickles/dialogue_mdl_epoch-10.pkl"
 with open(model_file, "rb") as fin:
     ver, *rest = pickle.load(fin)
 
@@ -66,10 +68,10 @@ hyper, vocab, weights = rest
 # Define the network architecture
 n_embed_char = hyper["n_embed_char"]              # 32
 n_hidden_encoder = hyper["n_hidden_encoder"]      # 256
+n_hidden_stack = hyper["n_hidden_stack"]          # 256
 n_hidden_decoder = hyper["n_hidden_decoder"]      # 512
 n_recurrent_layers = hyper["n_recurrent_layers"]  # 2
-b_xfeed = hyper["b_xfeed"]                        # False
-b_project = hyper["b_project"]                    # True
+n_stack_layers = hyper["n_stack_layers"]          # 2
 
 # Translate the characters into vocabulary IDs
 token_to_index = {w: i for i, w in enumerate(vocab)}
@@ -190,7 +192,7 @@ dec_rnn_layers = gru_column(l_decoder_embed, n_hidden_decoder, dec_hid_inputs,
 
 dec_rnn_layers_sliced = gru_hidden_readout(dec_rnn_layers, -1)
 
-l_decoder_reembedder = DenseLayer(dec_layers[-1], num_units=len(vocab),
+l_decoder_reembedder = DenseLayer(dec_rnn_layers[-1], num_units=len(vocab),
                                   nonlinearity=None, num_leading_axes=2,
                                   name="decoder/project")
 
@@ -317,7 +319,7 @@ n_steps = tt.iscalar("generator/n_steps")
 tau = tt.fscalar("generator/gumbel/tau")
 
 # Generator's input variables for the Encoder
-v_gen_input = tt.imatrix(name="generator/input")
+v_gen_input = tt.itensor3(name="generator/input")
 
 # Generator's embedding subnetwork readout for the Encoder
 v_gen_embed = lasagne.layers.get_output(l_embed_char, v_gen_input)
@@ -425,6 +427,13 @@ def reset(bot, update, args):
         update.message.reply_texte("you are not the Creator.")
         return
 
+    global context_db
+    if "all" in args:
+        # Broadcast reset message
+        for chat_id in context_db:
+            bot.sendMessage(chat_id, text="ChatBot restarted by the Creator.")
+        context_db = {}
+
     theano_random_state.seed(seed=0xDEADC0DE)
     # update.message.reply_text("%r" % args)
 
@@ -435,7 +444,8 @@ def reply(bot, update):
         context = alloc_context(chat_id)
         context.append("\x02" + update.message.text[:512] + "\x03")
 
-        query = as_tensor3(context, max_dialogue_len=None, max_len=None)
+        query = as_tensor3(context, max_dialogue_len=None,
+                           max_seq_len=None)
 
         results = generate(query, 200, tau=2**-5, n_samples=25)
         reply, perplexity = results[0]
